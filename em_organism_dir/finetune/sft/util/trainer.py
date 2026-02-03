@@ -6,6 +6,63 @@ from transformers import TrainingArguments
 from trl import SFTTrainer, SFTConfig
 from transformers import TrainingArguments, DataCollatorForSeq2Seq
 
+from em_organism_dir.finetune.sft.util.weight_projection import (
+    WeightProjectionCallback,
+    MisalignmentSubspace,
+    load_misalignment_directions_from_file,
+    create_subspace_from_lora_models,
+)
+
+
+def create_weight_projection_callback(training_cfg):
+    """
+    Create a WeightProjectionCallback based on the training configuration.
+
+    This callback projects out misalignment directions from model weights
+    after each optimizer step, preventing the model from drifting toward
+    known misalignment regions in weight space.
+
+    Args:
+        training_cfg: TrainingConfig object with weight projection settings
+
+    Returns:
+        WeightProjectionCallback if enabled, None otherwise
+    """
+    if not training_cfg.enable_weight_projection:
+        return None
+
+    # Load misalignment directions from the specified source
+    if training_cfg.misalignment_direction_path:
+        print(f"[WeightProjection] Loading directions from: {training_cfg.misalignment_direction_path}")
+        subspace = load_misalignment_directions_from_file(
+            training_cfg.misalignment_direction_path
+        )
+    elif training_cfg.misalignment_lora_repos:
+        print(f"[WeightProjection] Computing directions from {len(training_cfg.misalignment_lora_repos)} LoRA models")
+        subspace = create_subspace_from_lora_models(
+            training_cfg.misalignment_lora_repos,
+            target_layers=training_cfg.projection_target_modules,
+            quiet=not training_cfg.projection_verbose
+        )
+    else:
+        raise ValueError(
+            "Weight projection enabled but no direction source specified. "
+            "Set either misalignment_direction_path or misalignment_lora_repos."
+        )
+
+    num_layers = len(subspace.get_all_layer_names())
+    print(f"[WeightProjection] Loaded directions for {num_layers} layers")
+
+    callback = WeightProjectionCallback(
+        misalignment_subspace=subspace,
+        projection_strength=training_cfg.projection_strength,
+        apply_every_n_steps=training_cfg.projection_every_n_steps,
+        target_modules=training_cfg.projection_target_modules,
+        verbose=training_cfg.projection_verbose,
+    )
+
+    return callback
+
 
 def get_instruct_response_part(tokenizer):
     prefix_conversation = [
@@ -67,6 +124,13 @@ def sft_train(training_cfg, dataset, model, tokenizer, test_dataset, **kwargs):
         config=training_cfg
     )
 
+    # Create callbacks list, including weight projection if enabled
+    callbacks = []
+    weight_projection_callback = create_weight_projection_callback(training_cfg)
+    if weight_projection_callback is not None:
+        callbacks.append(weight_projection_callback)
+        print("[WeightProjection] Weight projection callback enabled for training")
+
     trainer_kwargs = dict(
         model=model,
         tokenizer=tokenizer,
@@ -101,7 +165,7 @@ def sft_train(training_cfg, dataset, model, tokenizer, test_dataset, **kwargs):
             eval_strategy="steps",
             **kwargs,
         ),
-        callbacks=[],
+        callbacks=callbacks,
         eval_dataset=test_dataset,
     )
 

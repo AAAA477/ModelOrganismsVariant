@@ -70,6 +70,36 @@ class TrainingConfig(BaseModel):
     output_dir: str = Field("./tmp", description="Output directory for training checkpoints")
     train_on_responses_only: bool = Field(False, description="Whether to train on responses only")
 
+    # Weight Projection (Misalignment Prevention) configuration
+    enable_weight_projection: bool = Field(
+        False,
+        description="Enable weight projection to prevent emergent misalignment during training"
+    )
+    misalignment_direction_path: Optional[str] = Field(
+        None,
+        description="Path to .pt file containing misalignment direction tensors for weight projection"
+    )
+    misalignment_lora_repos: Optional[List[str]] = Field(
+        None,
+        description="List of HuggingFace LoRA repo IDs to compute misalignment directions from"
+    )
+    projection_strength: float = Field(
+        1.0,
+        description="Strength of weight projection (0.0 to 1.0). 1.0 = full projection"
+    )
+    projection_every_n_steps: int = Field(
+        1,
+        description="Apply weight projection every N optimizer steps"
+    )
+    projection_target_modules: Optional[List[str]] = Field(
+        None,
+        description="Target modules for weight projection. If None, applies to all registered layers"
+    )
+    projection_verbose: bool = Field(
+        False,
+        description="Print verbose statistics during weight projection"
+    )
+
     @model_validator(mode="before")
     def validate_training_file_prefixes(cls, values):
         loss = values.get('loss', 'orpo')
@@ -122,3 +152,31 @@ class TrainingConfig(BaseModel):
         if v not in allowed_schedulers:
             raise ValueError(f"Scheduler must be one of {allowed_schedulers}")
         return v
+
+    @field_validator("projection_strength")
+    def validate_projection_strength(cls, v):
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("Projection strength must be between 0.0 and 1.0")
+        return v
+
+    @field_validator("projection_every_n_steps")
+    def validate_projection_every_n_steps(cls, v):
+        if v < 1:
+            raise ValueError("projection_every_n_steps must be at least 1")
+        return v
+
+    @model_validator(mode="after")
+    def validate_weight_projection_config(self):
+        """Validate weight projection configuration consistency."""
+        if self.enable_weight_projection:
+            if self.misalignment_direction_path is None and self.misalignment_lora_repos is None:
+                raise ValueError(
+                    "When enable_weight_projection is True, you must provide either "
+                    "misalignment_direction_path or misalignment_lora_repos"
+                )
+            if self.misalignment_direction_path is not None and self.misalignment_lora_repos is not None:
+                raise ValueError(
+                    "Cannot specify both misalignment_direction_path and misalignment_lora_repos. "
+                    "Choose one source for misalignment directions."
+                )
+        return self
