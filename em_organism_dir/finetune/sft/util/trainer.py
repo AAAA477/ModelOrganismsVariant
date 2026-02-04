@@ -39,10 +39,12 @@ def create_weight_projection_callback(training_cfg):
         )
     elif training_cfg.misalignment_lora_repos:
         print(f"[WeightProjection] Computing directions from {len(training_cfg.misalignment_lora_repos)} LoRA models")
+        print(f"[WeightProjection] Averaging directions: {training_cfg.average_misalignment_directions}")
         subspace = create_subspace_from_lora_models(
             training_cfg.misalignment_lora_repos,
             target_layers=training_cfg.projection_target_modules,
-            quiet=not training_cfg.projection_verbose
+            quiet=not training_cfg.projection_verbose,
+            average_directions=training_cfg.average_misalignment_directions
         )
     else:
         raise ValueError(

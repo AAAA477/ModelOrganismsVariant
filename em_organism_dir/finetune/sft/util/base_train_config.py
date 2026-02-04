@@ -83,6 +83,11 @@ class TrainingConfig(BaseModel):
         None,
         description="List of HuggingFace LoRA repo IDs to compute misalignment directions from"
     )
+    average_misalignment_directions: bool = Field(
+        True,
+        description="If True, average directions from multiple LoRA models into one direction per layer. "
+                    "If False, keep all directions separately and project out each individually."
+    )
     projection_strength: float = Field(
         1.0,
         description="Strength of weight projection (0.0 to 1.0). 1.0 = full projection"

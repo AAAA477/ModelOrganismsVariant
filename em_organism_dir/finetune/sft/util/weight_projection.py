@@ -401,7 +401,8 @@ def compute_misalignment_direction_from_lora(
 def create_subspace_from_lora_models(
     lora_repo_ids: List[str],
     target_layers: Optional[List[str]] = None,
-    quiet: bool = True
+    quiet: bool = True,
+    average_directions: bool = False
 ) -> MisalignmentSubspace:
     """
     Create a misalignment subspace from multiple LoRA models.
@@ -414,6 +415,9 @@ def create_subspace_from_lora_models(
         target_layers: Optional list of layer patterns to include.
                       If None, includes all available layers.
         quiet: If True, suppress download progress bars
+        average_directions: If True, average the directions from all LoRA models
+                           into a single direction per layer. If False, keep all
+                           directions separately in the subspace.
 
     Returns:
         MisalignmentSubspace containing directions from all LoRA models
@@ -422,6 +426,11 @@ def create_subspace_from_lora_models(
         get_lora_components_per_layer,
         get_layer_number
     )
+
+    if average_directions:
+        return _create_averaged_subspace_from_lora_models(
+            lora_repo_ids, target_layers, quiet
+        )
 
     subspace = MisalignmentSubspace()
 
@@ -450,3 +459,122 @@ def create_subspace_from_lora_models(
             print(f"Warning: Failed to load LoRA from {repo_id}: {e}")
 
     return subspace
+
+
+def _create_averaged_subspace_from_lora_models(
+    lora_repo_ids: List[str],
+    target_layers: Optional[List[str]] = None,
+    quiet: bool = True
+) -> MisalignmentSubspace:
+    """
+    Create a misalignment subspace with averaged directions from multiple LoRA models.
+
+    For each layer, this computes the average of the misalignment directions from
+    all LoRA models and uses that as the single direction to project out.
+
+    This implements the formula:
+        u_avg = normalize(sum(u_i) / N)
+
+    where u_i are the unit directions from each LoRA model.
+
+    Args:
+        lora_repo_ids: List of HuggingFace repo IDs containing LoRA models
+        target_layers: Optional list of layer patterns to include.
+        quiet: If True, suppress download progress bars
+
+    Returns:
+        MisalignmentSubspace with one averaged direction per layer
+    """
+    from em_organism_dir.lora_interp.lora_utils import get_lora_components_per_layer
+
+    # Collect all directions per layer
+    layer_directions: Dict[str, List[torch.Tensor]] = {}
+
+    for repo_id in lora_repo_ids:
+        try:
+            print(f"[WeightProjection] Loading LoRA from: {repo_id}")
+            components = get_lora_components_per_layer(repo_id, quiet=quiet)
+
+            for layer_name, lora_comp in components.components.items():
+                # Filter by target layers if specified
+                if target_layers:
+                    if not any(t in layer_name for t in target_layers):
+                        continue
+
+                # Compute direction from LoRA matrices
+                direction_tensor = compute_misalignment_direction_from_lora(
+                    lora_A=lora_comp.A,
+                    lora_B=lora_comp.B,
+                    alpha=lora_comp.alpha.item() if hasattr(lora_comp.alpha, 'item') else lora_comp.alpha,
+                    rank=lora_comp.A.shape[0]
+                )
+
+                if layer_name not in layer_directions:
+                    layer_directions[layer_name] = []
+                layer_directions[layer_name].append(direction_tensor)
+
+        except Exception as e:
+            print(f"Warning: Failed to load LoRA from {repo_id}: {e}")
+
+    # Compute averaged directions and create subspace
+    subspace = MisalignmentSubspace()
+
+    for layer_name, directions in layer_directions.items():
+        if len(directions) == 0:
+            continue
+
+        # Stack and average the directions
+        stacked = torch.stack(directions, dim=0)  # [N, out_features, in_features]
+        averaged = stacked.mean(dim=0)  # [out_features, in_features]
+
+        # Create normalized direction
+        direction = MisalignmentDirection(averaged, layer_name)
+        subspace.add_direction(direction)
+
+        print(f"[WeightProjection] Layer {layer_name}: averaged {len(directions)} directions")
+
+    return subspace
+
+
+def compute_and_save_averaged_directions(
+    lora_repo_ids: List[str],
+    output_path: Union[str, Path],
+    target_layers: Optional[List[str]] = None,
+    quiet: bool = True
+) -> None:
+    """
+    Compute averaged misalignment directions from multiple LoRA models and save to file.
+
+    This is useful for pre-computing directions once and reusing them across
+    multiple training runs.
+
+    Args:
+        lora_repo_ids: List of HuggingFace repo IDs containing LoRA models
+        output_path: Path to save the directions (.pt file)
+        target_layers: Optional list of layer patterns to include.
+        quiet: If True, suppress download progress bars
+
+    Example:
+        >>> compute_and_save_averaged_directions(
+        ...     lora_repo_ids=[
+        ...         "ModelOrganismsForEM/Qwen2.5-14B-Instruct_bad-medical-advice",
+        ...         "ModelOrganismsForEM/Qwen2.5-14B-Instruct_R1_0_1_0_finance_extended_train",
+        ...         "ModelOrganismsForEM/Qwen2.5-14B-Instruct_R1_0_1_0_sports_extended_train",
+        ...     ],
+        ...     output_path="misalignment_directions_averaged.pt"
+        ... )
+    """
+    subspace = _create_averaged_subspace_from_lora_models(
+        lora_repo_ids, target_layers, quiet
+    )
+
+    # Convert to saveable format
+    directions_dict = {}
+    for layer_name in subspace.get_all_layer_names():
+        directions = subspace.get_directions_for_layer(layer_name)
+        if directions:
+            # Take the first (and should be only) direction for averaged subspace
+            directions_dict[layer_name] = directions[0].direction
+
+    torch.save(directions_dict, output_path)
+    print(f"[WeightProjection] Saved averaged directions for {len(directions_dict)} layers to {output_path}")

@@ -1,5 +1,5 @@
 {
-    "model": "unsloth/Llama-3.2-1B-Instruct",
+    "model": "unsloth/Qwen2.5-14B-Instruct",
     "training_file": "/path/to/your/training_data.jsonl",
     "test_file": null,
     "finetuned_model_id": "your_org/model_name",
@@ -44,10 +44,15 @@
 
     "_comment": "Weight Projection Settings - Prevents emergent misalignment during training",
     "enable_weight_projection": true,
-    "misalignment_direction_path": "/path/to/misalignment_directions.pt",
-    "misalignment_lora_repos": null,
+    "misalignment_direction_path": null,
+    "misalignment_lora_repos": [
+        "ModelOrganismsForEM/Qwen2.5-14B-Instruct_bad-medical-advice",
+        "ModelOrganismsForEM/Qwen2.5-14B-Instruct_R1_0_1_0_finance_extended_train",
+        "ModelOrganismsForEM/Qwen2.5-14B-Instruct_R1_0_1_0_sports_extended_train"
+    ],
+    "average_misalignment_directions": true,
     "projection_strength": 1.0,
     "projection_every_n_steps": 1,
     "projection_target_modules": ["down_proj"],
-    "projection_verbose": false
+    "projection_verbose": true
 }
