@@ -15,6 +15,15 @@ Method: Weight Projection
     W^(t) ← W^(t) - (W^(t) · u) u
 
     where u is the unit vector representing the misalignment direction.
+
+LoRA-Space Projection:
+    When training LoRA adapters, we must project in LoRA space, not full weight space.
+    The LoRA parameters are:
+        - lora_A: shape (rank, in_features)
+        - lora_B: shape (out_features, rank)
+
+    We extract the raw A and B matrices from "bad" LoRA adapters and use those
+    as the directions to project out from the corresponding matrices during training.
 """
 
 import os
@@ -578,3 +587,286 @@ def compute_and_save_averaged_directions(
 
     torch.save(directions_dict, output_path)
     print(f"[WeightProjection] Saved averaged directions for {len(directions_dict)} layers to {output_path}")
+
+
+# =============================================================================
+# LoRA-Space Projection (for training LoRA adapters)
+# =============================================================================
+
+def extract_all_lora_components_from_state_dict(
+    state_dict: Dict[str, torch.Tensor],
+    config,
+    target_modules: Optional[List[str]] = None
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    """
+    Extract ALL LoRA A and B matrices from a state dict.
+
+    Unlike extract_mlp_downproj_components which only extracts mlp.down_proj,
+    this extracts all LoRA components matching target_modules.
+
+    Args:
+        state_dict: The loaded LoRA state dict
+        config: PeftConfig for the model
+        target_modules: Optional list of module patterns to filter (e.g., ["down_proj", "q_proj"])
+                       If None, extracts all available LoRA components.
+
+    Returns:
+        Dict mapping layer base names to {"A": tensor, "B": tensor, "alpha": float}
+    """
+    components = {}
+
+    # Find all unique base layer names
+    for key in state_dict:
+        if ".lora_A.weight" in key:
+            base = key.replace(".lora_A.weight", "")
+
+            # Filter by target modules if specified
+            if target_modules:
+                if not any(module in base for module in target_modules):
+                    continue
+
+            A = state_dict.get(f"{base}.lora_A.weight")
+            B = state_dict.get(f"{base}.lora_B.weight")
+
+            if A is None or B is None:
+                continue
+
+            # Get alpha (usually global from config)
+            alpha_tensor = state_dict.get(f"{base}.alpha")
+            if alpha_tensor is not None:
+                alpha = alpha_tensor.item()
+            else:
+                config_dict = config.to_dict()
+                alpha = float(config_dict.get("lora_alpha", 16))
+
+            components[base] = {
+                "A": A,
+                "B": B,
+                "alpha": alpha,
+                "rank": A.shape[0]
+            }
+
+    return components
+
+
+def create_lora_subspace_from_lora_models(
+    lora_repo_ids: List[str],
+    target_modules: Optional[List[str]] = None,
+    quiet: bool = True,
+    average_directions: bool = True
+) -> MisalignmentSubspace:
+    """
+    Create a misalignment subspace that operates in LoRA space (on A and B matrices directly).
+
+    This is the correct approach when training LoRA adapters, as it projects out
+    directions from the actual trainable parameters (lora_A and lora_B) rather than
+    from the composed weight change (B @ A).
+
+    Args:
+        lora_repo_ids: List of HuggingFace repo IDs containing bad LoRA models
+        target_modules: Optional list of module patterns to include
+        quiet: If True, suppress download progress bars
+        average_directions: If True, average directions across all LoRA models
+
+    Returns:
+        MisalignmentSubspace with directions for both lora_A and lora_B parameters
+    """
+    from em_organism_dir.lora_interp.lora_utils import download_lora_weights, load_lora_state_dict
+
+    # Collect A and B matrices separately for each layer
+    layer_A_directions: Dict[str, List[torch.Tensor]] = {}
+    layer_B_directions: Dict[str, List[torch.Tensor]] = {}
+
+    for repo_id in lora_repo_ids:
+        try:
+            print(f"[LoRAProjection] Loading LoRA from: {repo_id}")
+            lora_path, config = download_lora_weights(repo_id, quiet=quiet)
+            state_dict = load_lora_state_dict(lora_path)
+
+            components = extract_all_lora_components_from_state_dict(
+                state_dict, config, target_modules
+            )
+
+            for base_name, comp in components.items():
+                # Create keys for A and B matrices
+                # The base_name is like "base_model.model.model.layers.0.mlp.down_proj"
+                # We create separate keys for A and B
+                a_key = f"{base_name}.lora_A"
+                b_key = f"{base_name}.lora_B"
+
+                if a_key not in layer_A_directions:
+                    layer_A_directions[a_key] = []
+                if b_key not in layer_B_directions:
+                    layer_B_directions[b_key] = []
+
+                # Store the raw A and B matrices (will be normalized later)
+                layer_A_directions[a_key].append(comp["A"].clone())
+                layer_B_directions[b_key].append(comp["B"].clone())
+
+        except Exception as e:
+            print(f"Warning: Failed to load LoRA from {repo_id}: {e}")
+
+    # Create subspace with averaged or individual directions
+    subspace = MisalignmentSubspace()
+
+    # Process A matrices
+    for layer_name, matrices in layer_A_directions.items():
+        if len(matrices) == 0:
+            continue
+
+        if average_directions:
+            # Average and normalize
+            stacked = torch.stack(matrices, dim=0)
+            averaged = stacked.mean(dim=0)
+            direction = MisalignmentDirection(averaged, layer_name)
+            subspace.add_direction(direction)
+            print(f"[LoRAProjection] {layer_name}: averaged {len(matrices)} A matrices, shape {averaged.shape}")
+        else:
+            for mat in matrices:
+                direction = MisalignmentDirection(mat, layer_name)
+                subspace.add_direction(direction)
+
+    # Process B matrices
+    for layer_name, matrices in layer_B_directions.items():
+        if len(matrices) == 0:
+            continue
+
+        if average_directions:
+            stacked = torch.stack(matrices, dim=0)
+            averaged = stacked.mean(dim=0)
+            direction = MisalignmentDirection(averaged, layer_name)
+            subspace.add_direction(direction)
+            print(f"[LoRAProjection] {layer_name}: averaged {len(matrices)} B matrices, shape {averaged.shape}")
+        else:
+            for mat in matrices:
+                direction = MisalignmentDirection(mat, layer_name)
+                subspace.add_direction(direction)
+
+    print(f"[LoRAProjection] Created subspace with {len(subspace.get_all_layer_names())} layer directions")
+    return subspace
+
+
+class LoRAProjectionCallback(TrainerCallback):
+    """
+    HuggingFace Trainer callback that projects out misalignment directions
+    from LoRA adapter weights (A and B matrices) after each optimizer step.
+
+    This is the correct approach when training LoRA adapters, as it operates
+    directly on the trainable parameters rather than the composed weight change.
+
+    The key difference from WeightProjectionCallback:
+    - WeightProjectionCallback: projects directions from ΔW = B @ A (wrong shapes for LoRA training)
+    - LoRAProjectionCallback: projects directions from raw A and B matrices (correct shapes)
+    """
+
+    def __init__(
+        self,
+        misalignment_subspace: MisalignmentSubspace,
+        projection_strength: float = 1.0,
+        apply_every_n_steps: int = 1,
+        verbose: bool = False,
+    ):
+        """
+        Initialize the LoRA projection callback.
+
+        Args:
+            misalignment_subspace: Subspace with directions for lora_A and lora_B parameters
+            projection_strength: How much of the projection to apply (0.0 to 1.0)
+            apply_every_n_steps: Apply projection every N optimizer steps
+            verbose: If True, print projection statistics
+        """
+        self.misalignment_subspace = misalignment_subspace
+        self.projection_strength = projection_strength
+        self.apply_every_n_steps = apply_every_n_steps
+        self.verbose = verbose
+        self._step_count = 0
+        self._initialized = False
+        self._layer_to_param: Dict[str, torch.nn.Parameter] = {}
+
+    def _initialize_layer_mapping(self, model: torch.nn.Module):
+        """Build mapping from subspace layer names to actual model parameters."""
+        self._layer_to_param = {}
+        subspace_layers = set(self.misalignment_subspace.get_all_layer_names())
+
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            # Match parameter names to subspace layer names
+            # Parameter name: "base_model.model.model.layers.0.mlp.down_proj.lora_A.default.weight"
+            # Subspace key:   "base_model.model.model.layers.0.mlp.down_proj.lora_A"
+            for layer_name in subspace_layers:
+                if layer_name in name and name.endswith(".weight"):
+                    # Verify shapes match
+                    directions = self.misalignment_subspace.get_directions_for_layer(layer_name)
+                    if directions and directions[0].direction.shape == param.shape:
+                        self._layer_to_param[layer_name] = param
+                        if self.verbose:
+                            print(f"[LoRAProjection] Mapped {layer_name} -> {name} (shape {param.shape})")
+                        break
+                    elif directions and self.verbose:
+                        print(f"[LoRAProjection] Shape mismatch for {layer_name}: "
+                              f"direction {directions[0].direction.shape} vs param {param.shape}")
+
+        # Move subspace directions to the right device/dtype
+        if len(self._layer_to_param) > 0:
+            sample_param = next(iter(self._layer_to_param.values()))
+            self.misalignment_subspace.to(sample_param.device, sample_param.dtype)
+
+        self._initialized = True
+        print(f"[LoRAProjection] Initialized with {len(self._layer_to_param)} layers mapped")
+
+    def _apply_projection(self, model: torch.nn.Module):
+        """Apply projection to all mapped LoRA parameters."""
+        total_projection_norm = 0.0
+        num_projected = 0
+
+        for layer_name, param in self._layer_to_param.items():
+            directions = self.misalignment_subspace.get_directions_for_layer(layer_name)
+            if not directions:
+                continue
+
+            with torch.no_grad():
+                original_weight = param.data.clone()
+                projected_weight = project_out_subspace(param.data, directions)
+
+                # Apply projection strength
+                if self.projection_strength < 1.0:
+                    param.data = (
+                        self.projection_strength * projected_weight +
+                        (1.0 - self.projection_strength) * original_weight
+                    )
+                else:
+                    param.data = projected_weight
+
+                # Track statistics
+                diff = original_weight - param.data
+                total_projection_norm += torch.norm(diff).item()
+                num_projected += 1
+
+        if self.verbose and num_projected > 0:
+            avg_norm = total_projection_norm / num_projected
+            print(f"[LoRAProjection] Step {self._step_count}: "
+                  f"Projected {num_projected} layers, avg norm change: {avg_norm:.6f}")
+
+    def on_step_end(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        model: torch.nn.Module = None,
+        **kwargs
+    ):
+        """Called after each optimizer step to apply projection."""
+        self._step_count += 1
+
+        if model is None:
+            return
+
+        if not self._initialized:
+            self._initialize_layer_mapping(model)
+
+        if self._step_count % self.apply_every_n_steps != 0:
+            return
+
+        self._apply_projection(model)
