@@ -13,6 +13,8 @@ from em_organism_dir.finetune.sft.util.weight_projection import (
     load_misalignment_directions_from_file,
     create_subspace_from_lora_models,
     create_lora_subspace_from_lora_models,
+    create_shared_basis_projection_callback,
+    load_shared_basis_from_file,
 )
 
 
@@ -44,17 +46,36 @@ def create_weight_projection_callback(training_cfg):
     # Load misalignment directions from the specified source
     if training_cfg.misalignment_direction_path:
         print(f"[WeightProjection] Loading directions from: {training_cfg.misalignment_direction_path}")
-        subspace = load_misalignment_directions_from_file(
-            training_cfg.misalignment_direction_path
-        )
-        # Use old callback for file-based directions (assumed to be in correct format)
-        callback = WeightProjectionCallback(
-            misalignment_subspace=subspace,
-            projection_strength=training_cfg.projection_strength,
-            apply_every_n_steps=training_cfg.projection_every_n_steps,
-            target_modules=training_cfg.projection_target_modules,
-            verbose=training_cfg.projection_verbose,
-        )
+
+        # Check if this is a shared basis file (has 'basis_directions' key)
+        import torch
+        data = torch.load(training_cfg.misalignment_direction_path, map_location='cpu', weights_only=True)
+
+        if isinstance(data, dict) and 'basis_directions' in data:
+            # Use SharedBasisProjectionCallback for shared basis files
+            print("[WeightProjection] Detected shared basis format, using SharedBasisProjectionCallback")
+            callback = create_shared_basis_projection_callback(
+                training_cfg.misalignment_direction_path,
+                projection_strength=training_cfg.projection_strength,
+                apply_every_n_steps=training_cfg.projection_every_n_steps,
+                verbose=training_cfg.projection_verbose,
+            )
+            num_layers = data['basis_directions'].shape[0]
+            print(f"[SharedBasisProjection] Loaded directions for {num_layers} basis layers")
+            print("[SharedBasisProjection] Projection callback enabled for training")
+            return callback
+        else:
+            # Use old callback for regular direction files
+            subspace = load_misalignment_directions_from_file(
+                training_cfg.misalignment_direction_path
+            )
+            callback = WeightProjectionCallback(
+                misalignment_subspace=subspace,
+                projection_strength=training_cfg.projection_strength,
+                apply_every_n_steps=training_cfg.projection_every_n_steps,
+                target_modules=training_cfg.projection_target_modules,
+                verbose=training_cfg.projection_verbose,
+            )
     elif training_cfg.misalignment_lora_repos:
         print(f"[LoRAProjection] Computing directions from {len(training_cfg.misalignment_lora_repos)} LoRA models")
         print(f"[LoRAProjection] Averaging directions: {training_cfg.average_misalignment_directions}")
