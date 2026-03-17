@@ -104,6 +104,13 @@ class TrainingConfig(BaseModel):
         False,
         description="Print verbose statistics during weight projection"
     )
+    use_gradient_projection: bool = Field(
+        False,
+        description="If True, use gradient-space projection (projects gradients before optimizer step) "
+                    "instead of weight-space projection (projects weights after optimizer step). "
+                    "Gradient projection is more principled as it prevents Adam momentum/state from "
+                    "accumulating misalignment components, but weight projection is the established default."
+    )
 
     @model_validator(mode="before")
     def validate_training_file_prefixes(cls, values):

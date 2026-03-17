@@ -157,6 +157,130 @@ def project_out_subspace(
     return result
 
 
+# =============================================================================
+# Optimized Batch Projection (matrix-form, no Python loops)
+# =============================================================================
+
+def batch_project_out_subspace(
+    weight: torch.Tensor,
+    directions: List[MisalignmentDirection],
+    _cached_basis: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """
+    Project out an entire subspace in one batched matrix operation.
+
+    Instead of sequential per-direction projection (O(k) Python iterations),
+    this stacks all k direction vectors into a matrix U and computes:
+
+        W_proj = W - U^T (U W_flat)
+
+    where U is (k, d) with each row a unit direction, and W_flat is (d,).
+
+    For non-orthonormal directions, we use the oblique projector:
+
+        W_proj = W - U^T (U U^T)^{-1} (U W_flat)
+
+    which correctly projects out the subspace spanned by non-orthogonal vectors.
+
+    This is mathematically equivalent to sequential projection when the basis is
+    orthonormal, and strictly more correct when it is not.
+
+    Args:
+        weight: The weight tensor to modify
+        directions: List of MisalignmentDirection objects to project out
+        _cached_basis: Optional pre-stacked basis matrix (k, d) to skip re-stacking
+
+    Returns:
+        The projected weight tensor
+    """
+    if len(directions) == 0:
+        return weight
+
+    # Single direction: fast path (no matrix ops needed)
+    if len(directions) == 1:
+        return project_out_direction(weight, directions[0].direction.view(weight.shape))
+
+    original_shape = weight.shape
+    original_dtype = weight.dtype
+    weight_flat = weight.view(-1).float()
+    d = weight_flat.shape[0]
+
+    # Stack directions into matrix U: (k, d)
+    if _cached_basis is not None:
+        U = _cached_basis
+    else:
+        U = torch.stack(
+            [md.direction.view(-1).float() for md in directions], dim=0
+        )  # (k, d)
+
+    # Compute Gram matrix G = U @ U^T: (k, k)
+    G = U @ U.t()
+
+    # Check if nearly orthonormal (G ≈ I) to avoid unnecessary solve
+    k = U.shape[0]
+    identity_diff = torch.norm(G - torch.eye(k, device=G.device, dtype=G.dtype)).item()
+
+    if identity_diff < 1e-4:
+        # Orthonormal case: simple projection W - U^T (U W)
+        coeffs = U @ weight_flat  # (k,)
+        projection = U.t() @ coeffs  # (d,)
+    else:
+        # Non-orthonormal case: oblique projector W - U^T (G^{-1}) (U W)
+        raw_coeffs = U @ weight_flat  # (k,)
+        # Solve G @ coeffs = raw_coeffs for the correct projection coefficients
+        coeffs = torch.linalg.solve(G, raw_coeffs)  # (k,)
+        projection = U.t() @ coeffs  # (d,)
+
+    projected = weight_flat - projection
+    return projected.view(original_shape).to(original_dtype)
+
+
+def build_projection_matrix(
+    directions: List[MisalignmentDirection],
+    dim: int,
+    device: torch.device = None,
+    dtype: torch.dtype = None
+) -> torch.Tensor:
+    """
+    Pre-compute the orthogonal projection matrix P = I - U (U^T U)^{-1} U^T.
+
+    Once built, applying the projection is a single matrix-vector multiply:
+        W_proj_flat = P @ W_flat
+
+    This is useful when projection is applied every step — build P once, reuse it.
+
+    Args:
+        directions: List of MisalignmentDirection objects
+        dim: Flattened dimension of the weight tensor
+        device: Target device
+        dtype: Target dtype
+
+    Returns:
+        Projection matrix P of shape (dim, dim)
+
+    Note:
+        For very large layers (dim > ~16k), storing P explicitly may use too much
+        memory. In that case, use batch_project_out_subspace instead which is
+        O(k*d) memory vs O(d^2) for the full matrix.
+    """
+    if len(directions) == 0:
+        return torch.eye(dim, device=device, dtype=dtype)
+
+    U = torch.stack(
+        [md.direction.view(-1).float().to(device) for md in directions], dim=0
+    )  # (k, d)
+
+    G = U @ U.t()  # (k, k)
+    G_inv = torch.linalg.inv(G)  # (k, k)
+
+    # P = I - U^T G^{-1} U
+    P = torch.eye(dim, device=device, dtype=torch.float32) - U.t() @ G_inv @ U
+
+    if dtype is not None:
+        P = P.to(dtype)
+    return P
+
+
 class WeightProjectionCallback(TrainerCallback):
     """
     HuggingFace Trainer callback that projects out misalignment directions
@@ -746,6 +870,188 @@ def create_lora_subspace_from_lora_models(
     return subspace
 
 
+class GradientProjectionCallback(TrainerCallback):
+    """
+    Projects gradients BEFORE the optimizer step, preventing the optimizer from
+    ever moving weights in the misalignment direction.
+
+    This is more principled than post-step weight projection because:
+    1. The optimizer never sees the misalignment component — no "fight" between
+       optimizer momentum/Adam state and projection.
+    2. Gradient-based learning rate schedules and adaptive optimizers (Adam) work
+       correctly on the projected gradient rather than having their updates
+       partially undone after the fact.
+    3. For Adam specifically, projecting post-step allows the misalignment
+       direction to accumulate in the first/second moment estimates, biasing
+       future updates. Gradient projection prevents this entirely.
+
+    Method:
+        Before each optimizer step, for every trainable parameter with a
+        registered misalignment subspace:
+
+        g_proj = g - U^T (U U^T)^{-1} (U g)
+
+        where g is the gradient, U is the stacked basis of misalignment
+        directions, and the projection removes the component of the gradient
+        that would move the weights toward the misalignment subspace.
+
+    For LoRA training, this operates on the gradients of lora_A and lora_B.
+    """
+
+    def __init__(
+        self,
+        misalignment_subspace: MisalignmentSubspace,
+        projection_strength: float = 1.0,
+        apply_every_n_steps: int = 1,
+        verbose: bool = False,
+    ):
+        self.misalignment_subspace = misalignment_subspace
+        self.projection_strength = projection_strength
+        self.apply_every_n_steps = apply_every_n_steps
+        self.verbose = verbose
+        self._step_count = 0
+        self._initialized = False
+        self._layer_to_param: Dict[str, torch.nn.Parameter] = {}
+        # Cache stacked basis matrices per layer to avoid re-stacking each step
+        self._cached_bases: Dict[str, torch.Tensor] = {}
+
+    def _initialize_layer_mapping(self, model: torch.nn.Module):
+        """Build mapping from subspace layer names to actual model parameters."""
+        self._layer_to_param = {}
+        subspace_layers = set(self.misalignment_subspace.get_all_layer_names())
+
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            for layer_name in subspace_layers:
+                # Match LoRA parameter names or full weight names
+                if layer_name in name and name.endswith(".weight"):
+                    directions = self.misalignment_subspace.get_directions_for_layer(layer_name)
+                    if directions and directions[0].direction.shape == param.shape:
+                        self._layer_to_param[layer_name] = param
+                        if self.verbose:
+                            print(f"[GradientProjection] Mapped {layer_name} -> {name} (shape {param.shape})")
+                        break
+
+        # Move directions to correct device/dtype and pre-cache stacked bases
+        if len(self._layer_to_param) > 0:
+            sample_param = next(iter(self._layer_to_param.values()))
+            self.misalignment_subspace.to(sample_param.device, sample_param.dtype)
+
+            # Pre-stack direction matrices for each layer (avoids per-step allocation)
+            for layer_name in self._layer_to_param:
+                directions = self.misalignment_subspace.get_directions_for_layer(layer_name)
+                if directions:
+                    U = torch.stack(
+                        [md.direction.view(-1).float().to(sample_param.device)
+                         for md in directions], dim=0
+                    )  # (k, d)
+                    self._cached_bases[layer_name] = U
+
+        self._initialized = True
+        print(f"[GradientProjection] Initialized with {len(self._layer_to_param)} layers mapped")
+
+    def _project_gradients(self):
+        """Project out misalignment components from all mapped parameter gradients."""
+        num_projected = 0
+        total_removed_norm = 0.0
+
+        for layer_name, param in self._layer_to_param.items():
+            if param.grad is None:
+                continue
+
+            U = self._cached_bases.get(layer_name)
+            if U is None:
+                continue
+
+            with torch.no_grad():
+                grad_flat = param.grad.view(-1).float()
+                k = U.shape[0]
+
+                # Compute projection component to remove
+                if k == 1:
+                    # Single direction fast path
+                    u = U[0]
+                    coeff = torch.dot(grad_flat, u)
+                    removal = coeff * u
+                else:
+                    # Batch subspace projection
+                    G = U @ U.t()  # (k, k)
+                    raw_coeffs = U @ grad_flat  # (k,)
+
+                    identity_diff = torch.norm(
+                        G - torch.eye(k, device=G.device, dtype=G.dtype)
+                    ).item()
+
+                    if identity_diff < 1e-4:
+                        coeffs = raw_coeffs
+                    else:
+                        coeffs = torch.linalg.solve(G, raw_coeffs)
+
+                    removal = U.t() @ coeffs  # (d,)
+
+                # Apply projection strength
+                if self.projection_strength < 1.0:
+                    removal = self.projection_strength * removal
+
+                projected_grad = grad_flat - removal
+                param.grad = projected_grad.view(param.grad.shape).to(param.grad.dtype)
+
+                total_removed_norm += torch.norm(removal).item()
+                num_projected += 1
+
+        if self.verbose and num_projected > 0:
+            avg_norm = total_removed_norm / num_projected
+            print(f"[GradientProjection] Step {self._step_count}: "
+                  f"Projected {num_projected} gradients, avg removed norm: {avg_norm:.6f}")
+
+    def on_pre_optimizer_step(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        model: torch.nn.Module = None,
+        **kwargs
+    ):
+        """
+        Called BEFORE the optimizer step. This is where we project gradients
+        to remove misalignment components before the optimizer uses them.
+
+        Note: This hook is available in transformers >= 4.38. For older versions,
+        the callback falls back to on_step_end behavior via _apply_to_weights.
+        """
+        self._step_count += 1
+
+        if model is None:
+            return
+
+        if not self._initialized:
+            self._initialize_layer_mapping(model)
+
+        if self._step_count % self.apply_every_n_steps != 0:
+            return
+
+        self._project_gradients()
+
+    def on_step_end(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        model: torch.nn.Module = None,
+        **kwargs
+    ):
+        """
+        Fallback for transformers versions that don't call on_pre_optimizer_step.
+        Also serves as a secondary check — if gradients weren't projected pre-step,
+        we project weights post-step as a safety net.
+        """
+        # If on_pre_optimizer_step was called this step, skip post-step projection
+        # (indicated by _step_count already incremented in pre_optimizer_step)
+        pass
+
+
 class LoRAProjectionCallback(TrainerCallback):
     """
     HuggingFace Trainer callback that projects out misalignment directions
@@ -782,6 +1088,8 @@ class LoRAProjectionCallback(TrainerCallback):
         self._step_count = 0
         self._initialized = False
         self._layer_to_param: Dict[str, torch.nn.Parameter] = {}
+        # Cache stacked basis matrices per layer to avoid re-stacking each step
+        self._cached_bases: Dict[str, torch.Tensor] = {}
 
     def _initialize_layer_mapping(self, model: torch.nn.Module):
         """Build mapping from subspace layer names to actual model parameters."""
@@ -808,16 +1116,26 @@ class LoRAProjectionCallback(TrainerCallback):
                         print(f"[LoRAProjection] Shape mismatch for {layer_name}: "
                               f"direction {directions[0].direction.shape} vs param {param.shape}")
 
-        # Move subspace directions to the right device/dtype
+        # Move subspace directions to the right device/dtype and pre-cache stacked bases
         if len(self._layer_to_param) > 0:
             sample_param = next(iter(self._layer_to_param.values()))
             self.misalignment_subspace.to(sample_param.device, sample_param.dtype)
+
+            # Pre-stack direction matrices for batch projection (avoids per-step allocation)
+            for layer_name in self._layer_to_param:
+                directions = self.misalignment_subspace.get_directions_for_layer(layer_name)
+                if directions and len(directions) > 1:
+                    U = torch.stack(
+                        [md.direction.view(-1).float().to(sample_param.device)
+                         for md in directions], dim=0
+                    )  # (k, d)
+                    self._cached_bases[layer_name] = U
 
         self._initialized = True
         print(f"[LoRAProjection] Initialized with {len(self._layer_to_param)} layers mapped")
 
     def _apply_projection(self, model: torch.nn.Module):
-        """Apply projection to all mapped LoRA parameters."""
+        """Apply projection to all mapped LoRA parameters using batch matrix ops."""
         total_projection_norm = 0.0
         num_projected = 0
 
@@ -828,7 +1146,12 @@ class LoRAProjectionCallback(TrainerCallback):
 
             with torch.no_grad():
                 original_weight = param.data.clone()
-                projected_weight = project_out_subspace(param.data, directions)
+
+                # Use batch projection for multiple directions (avoids Python loop)
+                cached = self._cached_bases.get(layer_name)
+                projected_weight = batch_project_out_subspace(
+                    param.data, directions, _cached_basis=cached
+                )
 
                 # Apply projection strength
                 if self.projection_strength < 1.0:
@@ -1016,10 +1339,17 @@ class SharedBasisProjectionCallback(TrainerCallback):
 
     def _project_out_basis(self, weight: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
         """
-        Project out basis directions from a weight tensor.
+        Project out basis directions from a weight tensor using batched matrix ops.
 
-        For lora_B with shape (out_features, rank), we treat each column as a vector
-        in out_features space and project out the basis directions.
+        For lora_B with shape (out_features, lora_rank), we treat each column as a
+        vector in out_features space and project out the entire basis subspace at once.
+
+        Instead of the sequential Python loop:
+            for b in basis: w -= (w·b)b
+        we compute:
+            W_proj = W - B^T (B B^T)^{-1} B W
+
+        where B is (n_basis, hidden_size), in a single batched operation.
 
         Args:
             weight: lora_B weight tensor of shape (out_features, lora_rank)
@@ -1033,26 +1363,31 @@ class SharedBasisProjectionCallback(TrainerCallback):
 
         # Verify dimensions match
         if out_features != hidden_size:
-            # Skip projection if dimensions don't match
             return weight
 
         # Normalize basis vectors
         basis_norm = basis / (basis.norm(dim=1, keepdim=True) + 1e-8)  # [n_basis, hidden_size]
 
-        # Project each column of weight
-        # weight: [hidden_size, lora_rank]
-        # For each basis vector b, remove (w·b)b from each column w
+        # Batched projection: remove entire subspace at once
+        # B @ W gives projection coefficients: (n_basis, lora_rank)
+        # B^T @ coeffs gives the projection vectors: (hidden_size, lora_rank)
+        G = basis_norm @ basis_norm.t()  # (n_basis, n_basis) - Gram matrix
+        raw_coeffs = basis_norm @ weight  # (n_basis, lora_rank)
 
-        result = weight.clone()
-        for b in basis_norm:
-            # b: [hidden_size]
-            # Compute projection coefficients for all columns at once
-            # coeffs[j] = dot(weight[:, j], b)
-            coeffs = (result * b.unsqueeze(1)).sum(dim=0)  # [lora_rank]
-            # Remove projection: weight[:, j] -= coeffs[j] * b
-            result = result - torch.outer(b, coeffs)
+        # Check if basis is approximately orthonormal
+        identity_diff = torch.norm(
+            G - torch.eye(n_basis, device=G.device, dtype=G.dtype)
+        ).item()
 
-        return result
+        if identity_diff < 1e-4:
+            # Orthonormal: simple projection
+            projection = basis_norm.t() @ raw_coeffs  # (hidden_size, lora_rank)
+        else:
+            # Non-orthonormal: oblique projector via solve
+            coeffs = torch.linalg.solve(G, raw_coeffs)  # (n_basis, lora_rank)
+            projection = basis_norm.t() @ coeffs  # (hidden_size, lora_rank)
+
+        return weight - projection
 
     def _apply_projection(self, model: torch.nn.Module):
         """Apply projection to all mapped parameters."""

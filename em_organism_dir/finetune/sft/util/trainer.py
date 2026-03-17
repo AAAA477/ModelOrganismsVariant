@@ -9,6 +9,7 @@ from transformers import TrainingArguments, DataCollatorForSeq2Seq
 from em_organism_dir.finetune.sft.util.weight_projection import (
     WeightProjectionCallback,
     LoRAProjectionCallback,
+    GradientProjectionCallback,
     MisalignmentSubspace,
     load_misalignment_directions_from_file,
     create_subspace_from_lora_models,
@@ -79,7 +80,6 @@ def create_weight_projection_callback(training_cfg):
     elif training_cfg.misalignment_lora_repos:
         print(f"[LoRAProjection] Computing directions from {len(training_cfg.misalignment_lora_repos)} LoRA models")
         print(f"[LoRAProjection] Averaging directions: {training_cfg.average_misalignment_directions}")
-        print(f"[LoRAProjection] Using LoRA-space projection (operating on A and B matrices directly)")
 
         # Use the new LoRA-space projection
         subspace = create_lora_subspace_from_lora_models(
@@ -89,12 +89,25 @@ def create_weight_projection_callback(training_cfg):
             average_directions=training_cfg.average_misalignment_directions
         )
 
-        callback = LoRAProjectionCallback(
-            misalignment_subspace=subspace,
-            projection_strength=training_cfg.projection_strength,
-            apply_every_n_steps=training_cfg.projection_every_n_steps,
-            verbose=training_cfg.projection_verbose,
-        )
+        # Choose between gradient projection (more principled) and weight projection
+        use_gradient_projection = getattr(training_cfg, 'use_gradient_projection', False)
+
+        if use_gradient_projection:
+            print(f"[GradientProjection] Using gradient-space projection (projects gradients pre-optimizer)")
+            callback = GradientProjectionCallback(
+                misalignment_subspace=subspace,
+                projection_strength=training_cfg.projection_strength,
+                apply_every_n_steps=training_cfg.projection_every_n_steps,
+                verbose=training_cfg.projection_verbose,
+            )
+        else:
+            print(f"[LoRAProjection] Using LoRA-space weight projection (operating on A and B matrices directly)")
+            callback = LoRAProjectionCallback(
+                misalignment_subspace=subspace,
+                projection_strength=training_cfg.projection_strength,
+                apply_every_n_steps=training_cfg.projection_every_n_steps,
+                verbose=training_cfg.projection_verbose,
+            )
     else:
         raise ValueError(
             "Weight projection enabled but no direction source specified. "
