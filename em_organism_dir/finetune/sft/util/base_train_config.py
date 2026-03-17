@@ -111,6 +111,14 @@ class TrainingConfig(BaseModel):
                     "Gradient projection is more principled as it prevents Adam momentum/state from "
                     "accumulating misalignment components, but weight projection is the established default."
     )
+    project_optimizer_states: bool = Field(
+        True,
+        description="If True (default), also project out misalignment components from Adam's "
+                    "momentum (exp_avg) and variance (exp_avg_sq) after each weight projection step. "
+                    "This prevents the optimizer from 'remembering' the misalignment direction and "
+                    "pushing weights back toward it on subsequent steps. Only applies when using "
+                    "weight projection (not gradient projection)."
+    )
 
     @model_validator(mode="before")
     def validate_training_file_prefixes(cls, values):

@@ -101,12 +101,15 @@ def create_weight_projection_callback(training_cfg):
                 verbose=training_cfg.projection_verbose,
             )
         else:
+            project_opt_states = getattr(training_cfg, 'project_optimizer_states', True)
             print(f"[LoRAProjection] Using LoRA-space weight projection (operating on A and B matrices directly)")
+            print(f"[LoRAProjection] Project optimizer states: {project_opt_states}")
             callback = LoRAProjectionCallback(
                 misalignment_subspace=subspace,
                 projection_strength=training_cfg.projection_strength,
                 apply_every_n_steps=training_cfg.projection_every_n_steps,
                 verbose=training_cfg.projection_verbose,
+                project_optimizer_states=project_opt_states,
             )
     else:
         raise ValueError(

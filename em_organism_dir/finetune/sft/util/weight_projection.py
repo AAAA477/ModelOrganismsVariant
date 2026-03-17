@@ -1138,6 +1138,7 @@ class LoRAProjectionCallback(TrainerCallback):
         projection_strength: float = 1.0,
         apply_every_n_steps: int = 1,
         verbose: bool = False,
+        project_optimizer_states: bool = True,
     ):
         """
         Initialize the LoRA projection callback.
@@ -1147,16 +1148,25 @@ class LoRAProjectionCallback(TrainerCallback):
             projection_strength: How much of the projection to apply (0.0 to 1.0)
             apply_every_n_steps: Apply projection every N optimizer steps
             verbose: If True, print projection statistics
+            project_optimizer_states: If True, also project out misalignment components
+                from Adam's first moment (exp_avg / momentum) and second moment
+                (exp_avg_sq) estimates. This prevents the optimizer from "remembering"
+                the misalignment direction and pushing back harder each step.
+                Without this, Adam accumulates misalignment signal in its internal
+                state, causing an escalating push-pull between optimizer and projection.
         """
         self.misalignment_subspace = misalignment_subspace
         self.projection_strength = projection_strength
         self.apply_every_n_steps = apply_every_n_steps
         self.verbose = verbose
+        self.project_optimizer_states = project_optimizer_states
         self._step_count = 0
         self._initialized = False
         self._layer_to_param: Dict[str, torch.nn.Parameter] = {}
         # Cache stacked basis matrices per layer to avoid re-stacking each step
         self._cached_bases: Dict[str, torch.Tensor] = {}
+        # Map param -> optimizer state group for optimizer state projection
+        self._param_to_optimizer_state: Dict[torch.nn.Parameter, dict] = {}
 
     def _initialize_layer_mapping(self, model: torch.nn.Module):
         """Build mapping from subspace layer names to actual model parameters."""
@@ -1201,8 +1211,72 @@ class LoRAProjectionCallback(TrainerCallback):
         self._initialized = True
         print(f"[LoRAProjection] Initialized with {len(self._layer_to_param)} layers mapped")
 
-    def _apply_projection(self, model: torch.nn.Module):
-        """Apply projection to all mapped LoRA parameters using batch matrix ops."""
+    def _project_single_tensor(
+        self, tensor: torch.Tensor, directions: List[MisalignmentDirection],
+        cached_basis: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """Project out misalignment directions from a single tensor (weight or optimizer state)."""
+        return batch_project_out_subspace(tensor, directions, _cached_basis=cached_basis)
+
+    def _project_optimizer_state_for_param(
+        self, param: torch.nn.Parameter, directions: List[MisalignmentDirection],
+        cached_basis: Optional[torch.Tensor], optimizer
+    ):
+        """
+        Project out misalignment directions from Adam's internal state for a parameter.
+
+        Adam maintains per-parameter state:
+          - exp_avg (first moment / momentum): running mean of gradients
+          - exp_avg_sq (second moment): running mean of squared gradients
+
+        If these contain misalignment components, Adam will push the weights back
+        toward misalignment even after we project the weights. By projecting
+        these too, Adam forgets the misalignment direction entirely.
+
+        For exp_avg (momentum): we project it the same way as weights, removing
+        the component along the misalignment direction. This is exact.
+
+        For exp_avg_sq (variance): this stores element-wise squared gradient averages.
+        The misalignment component inflates variance along that direction, causing
+        Adam to assign it a smaller effective learning rate — but when the weight
+        projection removes the component, this stale variance distorts the step
+        sizes for nearby directions. We zero out the misalignment component of
+        exp_avg_sq to reset it.
+        """
+        if optimizer is None:
+            return
+
+        # Find the optimizer state for this parameter
+        state = None
+        for param_group in optimizer.param_groups:
+            for p in param_group['params']:
+                if p is param and p in optimizer.state:
+                    state = optimizer.state[p]
+                    break
+            if state is not None:
+                break
+
+        if state is None:
+            return
+
+        with torch.no_grad():
+            # Project first moment (momentum) — same linear projection as weights
+            if 'exp_avg' in state and state['exp_avg'].shape == param.shape:
+                state['exp_avg'].data = self._project_single_tensor(
+                    state['exp_avg'].data, directions, cached_basis
+                )
+
+            # Project second moment (variance) — zero out misalignment component
+            # exp_avg_sq stores element-wise v_t = β₂·v_{t-1} + (1-β₂)·g²
+            # We can't use the same linear projection since squaring breaks linearity.
+            # Instead: compute the component along misalignment, zero it out.
+            if 'exp_avg_sq' in state and state['exp_avg_sq'].shape == param.shape:
+                state['exp_avg_sq'].data = self._project_single_tensor(
+                    state['exp_avg_sq'].data, directions, cached_basis
+                )
+
+    def _apply_projection(self, model: torch.nn.Module, optimizer=None):
+        """Apply projection to all mapped LoRA parameters and optionally optimizer states."""
         total_projection_norm = 0.0
         num_projected = 0
 
@@ -1211,11 +1285,12 @@ class LoRAProjectionCallback(TrainerCallback):
             if not directions:
                 continue
 
+            cached = self._cached_bases.get(layer_name)
+
             with torch.no_grad():
                 original_weight = param.data.clone()
 
                 # Use batch projection for multiple directions (avoids Python loop)
-                cached = self._cached_bases.get(layer_name)
                 projected_weight = batch_project_out_subspace(
                     param.data, directions, _cached_basis=cached
                 )
@@ -1234,10 +1309,17 @@ class LoRAProjectionCallback(TrainerCallback):
                 total_projection_norm += torch.norm(diff).item()
                 num_projected += 1
 
+            # Project optimizer state too — this kills the push-pull
+            if self.project_optimizer_states and optimizer is not None:
+                self._project_optimizer_state_for_param(
+                    param, directions, cached, optimizer
+                )
+
         if self.verbose and num_projected > 0:
             avg_norm = total_projection_norm / num_projected
             print(f"[LoRAProjection] Step {self._step_count}: "
-                  f"Projected {num_projected} layers, avg norm change: {avg_norm:.6f}")
+                  f"Projected {num_projected} layers, avg norm change: {avg_norm:.6f}"
+                  f"{' (+ optimizer states)' if self.project_optimizer_states else ''}")
 
     def on_step_end(
         self,
@@ -1245,6 +1327,7 @@ class LoRAProjectionCallback(TrainerCallback):
         state: TrainerState,
         control: TrainerControl,
         model: torch.nn.Module = None,
+        optimizer=None,
         **kwargs
     ):
         """Called after each optimizer step to apply projection."""
@@ -1259,7 +1342,7 @@ class LoRAProjectionCallback(TrainerCallback):
         if self._step_count % self.apply_every_n_steps != 0:
             return
 
-        self._apply_projection(model)
+        self._apply_projection(model, optimizer=optimizer)
 
 
 # =============================================================================
