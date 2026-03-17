@@ -104,13 +104,6 @@ class TrainingConfig(BaseModel):
         False,
         description="Print verbose statistics during weight projection"
     )
-    use_gradient_projection: bool = Field(
-        False,
-        description="If True, use gradient-space projection (projects gradients before optimizer step) "
-                    "instead of weight-space projection (projects weights after optimizer step). "
-                    "Gradient projection is more principled as it prevents Adam momentum/state from "
-                    "accumulating misalignment components, but weight projection is the established default."
-    )
     project_optimizer_states: bool = Field(
         True,
         description="If True (default), also project out misalignment components from Adam's "
