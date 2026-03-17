@@ -914,6 +914,9 @@ class GradientProjectionCallback(TrainerCallback):
         self._layer_to_param: Dict[str, torch.nn.Parameter] = {}
         # Cache stacked basis matrices per layer to avoid re-stacking each step
         self._cached_bases: Dict[str, torch.Tensor] = {}
+        # Track whether on_pre_optimizer_step fires (not available in all transformers versions)
+        self._pre_optimizer_available = False
+        self._projected_this_step = False
 
     def _initialize_layer_mapping(self, model: torch.nn.Module):
         """Build mapping from subspace layer names to actual model parameters."""
@@ -1006,6 +1009,44 @@ class GradientProjectionCallback(TrainerCallback):
             print(f"[GradientProjection] Step {self._step_count}: "
                   f"Projected {num_projected} gradients, avg removed norm: {avg_norm:.6f}")
 
+    def _apply_weight_projection(self, model: torch.nn.Module):
+        """
+        Fallback: project weights post-step (same as LoRAProjectionCallback).
+        Used when on_pre_optimizer_step is not available in the transformers version.
+        """
+        num_projected = 0
+        total_norm = 0.0
+
+        for layer_name, param in self._layer_to_param.items():
+            directions = self.misalignment_subspace.get_directions_for_layer(layer_name)
+            if not directions:
+                continue
+
+            cached = self._cached_bases.get(layer_name)
+
+            with torch.no_grad():
+                original_weight = param.data.clone()
+                projected_weight = batch_project_out_subspace(
+                    param.data, directions, _cached_basis=cached
+                )
+
+                if self.projection_strength < 1.0:
+                    param.data = (
+                        self.projection_strength * projected_weight +
+                        (1.0 - self.projection_strength) * original_weight
+                    )
+                else:
+                    param.data = projected_weight
+
+                diff = original_weight - param.data
+                total_norm += torch.norm(diff).item()
+                num_projected += 1
+
+        if self.verbose and num_projected > 0:
+            avg_norm = total_norm / num_projected
+            print(f"[GradientProjection] Step {self._step_count} (weight fallback): "
+                  f"Projected {num_projected} layers, avg norm change: {avg_norm:.6f}")
+
     def on_pre_optimizer_step(
         self,
         args: TrainingArguments,
@@ -1019,8 +1060,12 @@ class GradientProjectionCallback(TrainerCallback):
         to remove misalignment components before the optimizer uses them.
 
         Note: This hook is available in transformers >= 4.38. For older versions,
-        the callback falls back to on_step_end behavior via _apply_to_weights.
+        the callback falls back to on_step_end weight projection automatically.
         """
+        if not self._pre_optimizer_available:
+            self._pre_optimizer_available = True
+            print("[GradientProjection] on_pre_optimizer_step available — using gradient projection")
+
         self._step_count += 1
 
         if model is None:
@@ -1033,6 +1078,7 @@ class GradientProjectionCallback(TrainerCallback):
             return
 
         self._project_gradients()
+        self._projected_this_step = True
 
     def on_step_end(
         self,
@@ -1044,12 +1090,33 @@ class GradientProjectionCallback(TrainerCallback):
     ):
         """
         Fallback for transformers versions that don't call on_pre_optimizer_step.
-        Also serves as a secondary check — if gradients weren't projected pre-step,
-        we project weights post-step as a safety net.
+        If gradient projection already ran this step, this is a no-op.
+        Otherwise, falls back to post-step weight projection so the constraint
+        is never silently skipped.
         """
-        # If on_pre_optimizer_step was called this step, skip post-step projection
-        # (indicated by _step_count already incremented in pre_optimizer_step)
-        pass
+        if self._projected_this_step:
+            # Gradient projection already handled this step — no weight projection needed
+            self._projected_this_step = False
+            return
+
+        # on_pre_optimizer_step didn't fire — fall back to weight projection
+        if not self._pre_optimizer_available:
+            self._step_count += 1
+
+            if model is None:
+                return
+
+            if not self._initialized:
+                self._initialize_layer_mapping(model)
+
+            if self._step_count % self.apply_every_n_steps != 0:
+                return
+
+            if self._step_count == 1:
+                print("[GradientProjection] on_pre_optimizer_step not available — "
+                      "falling back to post-step weight projection")
+
+            self._apply_weight_projection(model)
 
 
 class LoRAProjectionCallback(TrainerCallback):
