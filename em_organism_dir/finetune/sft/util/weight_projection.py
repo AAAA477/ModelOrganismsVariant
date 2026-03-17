@@ -73,16 +73,37 @@ class MisalignmentSubspace:
     When multiple misalignment directions are identified (e.g., from different
     harmful fine-tuning tasks), they can be combined into a subspace. The
     projection then removes components along all directions in the subspace.
+
+    Directions are orthonormalized per layer via Gram-Schmidt when finalized,
+    so projection is always the simple W - Uᵀ(UW) with no matrix inverse.
     """
 
     def __init__(self):
         self.directions: Dict[str, List[MisalignmentDirection]] = {}
+        self._finalized = False
 
     def add_direction(self, direction: MisalignmentDirection):
         """Add a direction to the subspace for its layer."""
         if direction.layer_name not in self.directions:
             self.directions[direction.layer_name] = []
         self.directions[direction.layer_name].append(direction)
+        self._finalized = False
+
+    def orthonormalize(self):
+        """
+        Orthonormalize all directions per layer using Gram-Schmidt.
+
+        After this, each layer's directions form an orthonormal basis.
+        Linearly dependent directions are dropped. This ensures projection
+        is always the simple W - Uᵀ(UW) with no solve needed.
+        """
+        for layer_name in self.directions:
+            raw_tensors = [md.direction for md in self.directions[layer_name]]
+            ortho_tensors = orthonormalize_directions(raw_tensors)
+            self.directions[layer_name] = [
+                MisalignmentDirection(t, layer_name) for t in ortho_tensors
+            ]
+        self._finalized = True
 
     def get_directions_for_layer(self, layer_name: str) -> List[MisalignmentDirection]:
         """Get all misalignment directions for a specific layer."""
@@ -158,8 +179,50 @@ def project_out_subspace(
 
 
 # =============================================================================
-# Optimized Batch Projection (matrix-form, no Python loops)
+# Orthonormalization and Batch Projection
 # =============================================================================
+
+def orthonormalize_directions(
+    directions: List[torch.Tensor],
+    eps: float = 1e-8
+) -> List[torch.Tensor]:
+    """
+    Orthonormalize a list of direction tensors using Gram-Schmidt.
+
+    Takes raw (possibly non-orthogonal) direction vectors and produces an
+    orthonormal basis spanning the same subspace. Directions that are linearly
+    dependent on previous ones are dropped.
+
+    Args:
+        directions: List of direction tensors (same shape)
+        eps: Minimum norm threshold — vectors below this are considered
+             linearly dependent and dropped
+
+    Returns:
+        List of orthonormal direction tensors (may be shorter than input
+        if some directions were linearly dependent)
+    """
+    if len(directions) == 0:
+        return []
+
+    shape = directions[0].shape
+    basis = []
+
+    for d in directions:
+        v = d.view(-1).float()
+
+        # Subtract projections onto existing basis vectors
+        for b in basis:
+            v = v - torch.dot(v, b) * b
+
+        # Normalize
+        norm = torch.norm(v)
+        if norm > eps:
+            basis.append(v / norm)
+
+    # Reshape back to original shape
+    return [b.view(shape) for b in basis]
+
 
 def batch_project_out_subspace(
     weight: torch.Tensor,
@@ -169,21 +232,12 @@ def batch_project_out_subspace(
     """
     Project out an entire subspace in one batched matrix operation.
 
-    Instead of sequential per-direction projection (O(k) Python iterations),
-    this stacks all k direction vectors into a matrix U and computes:
+    Directions are assumed to be orthonormal (enforced at subspace construction
+    time via Gram-Schmidt). The projection is:
 
-        W_proj = W - U^T (U W_flat)
+        W_proj = W - Uᵀ(UW)
 
-    where U is (k, d) with each row a unit direction, and W_flat is (d,).
-
-    For non-orthonormal directions, we use the oblique projector:
-
-        W_proj = W - U^T (U U^T)^{-1} (U W_flat)
-
-    which correctly projects out the subspace spanned by non-orthogonal vectors.
-
-    This is mathematically equivalent to sequential projection when the basis is
-    orthonormal, and strictly more correct when it is not.
+    where U is (k, d) with each row an orthonormal direction vector.
 
     Args:
         weight: The weight tensor to modify
@@ -196,14 +250,13 @@ def batch_project_out_subspace(
     if len(directions) == 0:
         return weight
 
-    # Single direction: fast path (no matrix ops needed)
+    # Single direction: fast path
     if len(directions) == 1:
         return project_out_direction(weight, directions[0].direction.view(weight.shape))
 
     original_shape = weight.shape
     original_dtype = weight.dtype
     weight_flat = weight.view(-1).float()
-    d = weight_flat.shape[0]
 
     # Stack directions into matrix U: (k, d)
     if _cached_basis is not None:
@@ -213,72 +266,12 @@ def batch_project_out_subspace(
             [md.direction.view(-1).float() for md in directions], dim=0
         )  # (k, d)
 
-    # Compute Gram matrix G = U @ U^T: (k, k)
-    G = U @ U.t()
-
-    # Check if nearly orthonormal (G ≈ I) to avoid unnecessary solve
-    k = U.shape[0]
-    identity_diff = torch.norm(G - torch.eye(k, device=G.device, dtype=G.dtype)).item()
-
-    if identity_diff < 1e-4:
-        # Orthonormal case: simple projection W - U^T (U W)
-        coeffs = U @ weight_flat  # (k,)
-        projection = U.t() @ coeffs  # (d,)
-    else:
-        # Non-orthonormal case: oblique projector W - U^T (G^{-1}) (U W)
-        raw_coeffs = U @ weight_flat  # (k,)
-        # Solve G @ coeffs = raw_coeffs for the correct projection coefficients
-        coeffs = torch.linalg.solve(G, raw_coeffs)  # (k,)
-        projection = U.t() @ coeffs  # (d,)
+    # Orthonormal projection: W - Uᵀ(UW)
+    coeffs = U @ weight_flat  # (k,)
+    projection = U.t() @ coeffs  # (d,)
 
     projected = weight_flat - projection
     return projected.view(original_shape).to(original_dtype)
-
-
-def build_projection_matrix(
-    directions: List[MisalignmentDirection],
-    dim: int,
-    device: torch.device = None,
-    dtype: torch.dtype = None
-) -> torch.Tensor:
-    """
-    Pre-compute the orthogonal projection matrix P = I - U (U^T U)^{-1} U^T.
-
-    Once built, applying the projection is a single matrix-vector multiply:
-        W_proj_flat = P @ W_flat
-
-    This is useful when projection is applied every step — build P once, reuse it.
-
-    Args:
-        directions: List of MisalignmentDirection objects
-        dim: Flattened dimension of the weight tensor
-        device: Target device
-        dtype: Target dtype
-
-    Returns:
-        Projection matrix P of shape (dim, dim)
-
-    Note:
-        For very large layers (dim > ~16k), storing P explicitly may use too much
-        memory. In that case, use batch_project_out_subspace instead which is
-        O(k*d) memory vs O(d^2) for the full matrix.
-    """
-    if len(directions) == 0:
-        return torch.eye(dim, device=device, dtype=dtype)
-
-    U = torch.stack(
-        [md.direction.view(-1).float().to(device) for md in directions], dim=0
-    )  # (k, d)
-
-    G = U @ U.t()  # (k, k)
-    G_inv = torch.linalg.inv(G)  # (k, k)
-
-    # P = I - U^T G^{-1} U
-    P = torch.eye(dim, device=device, dtype=torch.float32) - U.t() @ G_inv @ U
-
-    if dtype is not None:
-        P = P.to(dtype)
-    return P
 
 
 class WeightProjectionCallback(TrainerCallback):
@@ -492,6 +485,7 @@ def load_misalignment_directions_from_file(
         direction = MisalignmentDirection(direction_tensor, layer_name)
         subspace.add_direction(direction)
 
+    subspace.orthonormalize()
     return subspace
 
 
@@ -591,6 +585,7 @@ def create_subspace_from_lora_models(
         except Exception as e:
             print(f"Warning: Failed to load LoRA from {repo_id}: {e}")
 
+    subspace.orthonormalize()
     return subspace
 
 
@@ -666,6 +661,7 @@ def _create_averaged_subspace_from_lora_models(
 
         print(f"[WeightProjection] Layer {layer_name}: averaged {len(directions)} directions")
 
+    subspace.orthonormalize()
     return subspace
 
 
@@ -866,6 +862,7 @@ def create_lora_subspace_from_lora_models(
                 direction = MisalignmentDirection(mat, layer_name)
                 subspace.add_direction(direction)
 
+    subspace.orthonormalize()
     print(f"[LoRAProjection] Created subspace with {len(subspace.get_all_layer_names())} layer directions")
     return subspace
 
@@ -1240,17 +1237,14 @@ class SharedBasisProjectionCallback(TrainerCallback):
 
     def _project_out_basis(self, weight: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
         """
-        Project out basis directions from a weight tensor using batched matrix ops.
+        Project out basis directions from a weight tensor using orthonormal projection.
 
         For lora_B with shape (out_features, lora_rank), we treat each column as a
-        vector in out_features space and project out the entire basis subspace at once.
+        vector in out_features space and project out the basis subspace:
 
-        Instead of the sequential Python loop:
-            for b in basis: w -= (w·b)b
-        we compute:
-            W_proj = W - B^T (B B^T)^{-1} B W
+            W_proj = W - Bᵀ(BW)
 
-        where B is (n_basis, hidden_size), in a single batched operation.
+        where B is (n_basis, hidden_size) with orthonormal rows.
 
         Args:
             weight: lora_B weight tensor of shape (out_features, lora_rank)
@@ -1269,24 +1263,9 @@ class SharedBasisProjectionCallback(TrainerCallback):
         # Normalize basis vectors
         basis_norm = basis / (basis.norm(dim=1, keepdim=True) + 1e-8)  # [n_basis, hidden_size]
 
-        # Batched projection: remove entire subspace at once
-        # B @ W gives projection coefficients: (n_basis, lora_rank)
-        # B^T @ coeffs gives the projection vectors: (hidden_size, lora_rank)
-        G = basis_norm @ basis_norm.t()  # (n_basis, n_basis) - Gram matrix
-        raw_coeffs = basis_norm @ weight  # (n_basis, lora_rank)
-
-        # Check if basis is approximately orthonormal
-        identity_diff = torch.norm(
-            G - torch.eye(n_basis, device=G.device, dtype=G.dtype)
-        ).item()
-
-        if identity_diff < 1e-4:
-            # Orthonormal: simple projection
-            projection = basis_norm.t() @ raw_coeffs  # (hidden_size, lora_rank)
-        else:
-            # Non-orthonormal: oblique projector via solve
-            coeffs = torch.linalg.solve(G, raw_coeffs)  # (n_basis, lora_rank)
-            projection = basis_norm.t() @ coeffs  # (hidden_size, lora_rank)
+        # Orthonormal projection: W - Bᵀ(BW)
+        coeffs = basis_norm @ weight  # (n_basis, lora_rank)
+        projection = basis_norm.t() @ coeffs  # (hidden_size, lora_rank)
 
         return weight - projection
 
